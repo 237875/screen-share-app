@@ -17,7 +17,7 @@
   <video id="video" autoplay playsinline controls style="width:600px;"></video>
 
 <script>
-const SUPABASE_URL = "https://tvdrhuwhrazvoegsxykb.supabase.co"; // ✅ FIXED
+const SUPABASE_URL = "https://tvdrhuwhrazvoegsxykb.supabase.co";
 const SUPABASE_KEY = "sb_publishable_TYeHsv6kmk2KETnhYNapAg_Zc6j8LDi";
 
 const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -39,10 +39,8 @@ async function startSharing() {
 
     pc = new RTCPeerConnection();
 
-    // 👇 THIS SHOULD TRIGGER PROMPT
     localStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
 
-    // Show your own screen locally (important for testing)
     document.getElementById("video").srcObject = localStream;
 
     localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
@@ -99,16 +97,25 @@ async function join() {
       }
     };
 
+    // ✅ FIXED: get latest offer instead of .single()
     const { data, error } = await supabaseClient
       .from("signals")
       .select("*")
       .eq("room", room)
       .eq("type", "offer")
-      .single();
+      .order("created_at", { ascending: false })
+      .limit(1);
 
     if (error) throw error;
 
-    await pc.setRemoteDescription(new RTCSessionDescription(data.data));
+    if (!data || data.length === 0) {
+      alert("No offer found. Make sure someone clicked Start Sharing first.");
+      return;
+    }
+
+    const offerData = data[0];
+
+    await pc.setRemoteDescription(new RTCSessionDescription(offerData.data));
 
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
