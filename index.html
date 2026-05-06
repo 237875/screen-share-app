@@ -11,7 +11,7 @@
   <button onclick="startSharing()">Start Sharing</button>
   <button onclick="join()">Join</button>
 
-  <p id="status"></p>
+  <p id="status">Idle</p>
 
   <br><br>
   <video id="video" autoplay playsinline controls style="width:600px;"></video>
@@ -30,6 +30,26 @@ function setStatus(msg) {
   document.getElementById("status").innerText = msg;
 }
 
+function createPeerConnection() {
+  const pc = new RTCPeerConnection();
+
+  pc.ontrack = (event) => {
+    document.getElementById("video").srcObject = event.streams[0];
+  };
+
+  pc.onicecandidate = async (event) => {
+    if (event.candidate) {
+      await supabaseClient.from("signals").insert({
+        room,
+        type: "candidate",
+        data: event.candidate
+      });
+    }
+  };
+
+  return pc;
+}
+
 async function startSharing() {
   try {
     setStatus("Starting screen share...");
@@ -37,23 +57,14 @@ async function startSharing() {
     room = document.getElementById("room").value;
     if (!room) return alert("Enter a room name");
 
-    pc = new RTCPeerConnection();
+    pc = createPeerConnection();
 
+    // 👇 This triggers screen share prompt
     localStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
 
     document.getElementById("video").srcObject = localStream;
 
     localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-
-    pc.onicecandidate = async (event) => {
-      if (event.candidate) {
-        await supabaseClient.from("signals").insert({
-          room,
-          type: "candidate",
-          data: event.candidate
-        });
-      }
-    };
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -76,33 +87,84 @@ async function startSharing() {
 
 async function join() {
   try {
-    setStatus("Joining...");
+    setStatus("Joining... waiting for host...");
 
     room = document.getElementById("room").value;
     if (!room) return alert("Enter a room name");
 
-    pc = new RTCPeerConnection();
+    pc = createPeerConnection();
 
-    pc.ontrack = (event) => {
-      document.getElementById("video").srcObject = event.streams[0];
-    };
+    // 👇 Listen for EVERYTHING (offer + candidates)
+    supabaseClient
+      .channel("room-" + room)
+      .on("postgres_changes", {
+        event: "INSERT",
+        schema: "public",
+        table: "signals",
+        filter: "room=eq." + room
+      }, async (payload) => {
 
-    pc.onicecandidate = async (event) => {
-      if (event.candidate) {
-        await supabaseClient.from("signals").insert({
-          room,
-          type: "candidate",
-          data: event.candidate
-        });
+        if (payload.new.type === "offer") {
+          setStatus("Offer received! Connecting...");
+
+          await pc.setRemoteDescription(new RTCSessionDescription(payload.new.data));
+
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          await supabaseClient.from("signals").insert({
+            room,
+            type: "answer",
+            data: answer
+          });
+        }
+
+        if (payload.new.type === "candidate") {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(payload.new.data));
+          } catch (e) {
+            console.warn("Candidate error:", e);
+          }
+        }
+      })
+      .subscribe();
+
+  } catch (err) {
+    console.error(err);
+    alert("ERROR: " + err.message);
+    setStatus("Error: " + err.message);
+  }
+}
+
+function listenForAnswer() {
+  supabaseClient
+    .channel("room-answer-" + room)
+    .on("postgres_changes", {
+      event: "INSERT",
+      schema: "public",
+      table: "signals",
+      filter: "room=eq." + room
+    }, async (payload) => {
+
+      if (payload.new.type === "answer") {
+        setStatus("Viewer connected!");
+
+        await pc.setRemoteDescription(new RTCSessionDescription(payload.new.data));
       }
-    };
 
-    // ✅ FIXED: get latest offer instead of .single()
-    const { data, error } = await supabaseClient
-      .from("signals")
-      .select("*")
-      .eq("room", room)
-      .eq("type", "offer")
+      if (payload.new.type === "candidate") {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(payload.new.data));
+        } catch (e) {
+          console.warn("Candidate error:", e);
+        }
+      }
+    })
+    .subscribe();
+}
+</script>
+</body>
+</html>      .eq("type", "offer")
       .order("created_at", { ascending: false })
       .limit(1);
 
