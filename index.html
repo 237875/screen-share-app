@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Screen Share App</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+  <h2>Screen Share</h2>
+
+  <input id="room" placeholder="Room name">
+  <button onclick="startSharing()">Start Sharing</button>
+  <button onclick="join()">Join</button>
+
+  <p id="status"></p>
+
+  <br><br>
+  <video id="video" autoplay playsinline controls style="width:600px;"></video>
+
+<script>
+const SUPABASE_URL = "https://tvdrhuwhrazvoegsxykb.supabase.co"; // ✅ FIXED
+const SUPABASE_KEY = "sb_publishable_TYeHsv6kmk2KETnhYNapAg_Zc6j8LDi";
+
+const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+let pc;
+let room;
+let localStream;
+
+function setStatus(msg) {
+  document.getElementById("status").innerText = msg;
+}
+
+async function startSharing() {
+  try {
+    setStatus("Starting screen share...");
+
+    room = document.getElementById("room").value;
+    if (!room) return alert("Enter a room name");
+
+    pc = new RTCPeerConnection();
+
+    // 👇 THIS SHOULD TRIGGER PROMPT
+    localStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+
+    // Show your own screen locally (important for testing)
+    document.getElementById("video").srcObject = localStream;
+
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+    pc.onicecandidate = async (event) => {
+      if (event.candidate) {
+        await supabaseClient.from("signals").insert({
+          room,
+          type: "candidate",
+          data: event.candidate
+        });
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    await supabaseClient.from("signals").insert({
+      room,
+      type: "offer",
+      data: offer
+    });
+
+    listenForAnswer();
+
+    setStatus("Sharing started. Waiting for viewer...");
+  } catch (err) {
+    console.error(err);
+    alert("ERROR: " + err.message);
+    setStatus("Error: " + err.message);
+  }
+}
+
+async function join() {
+  try {
+    setStatus("Joining...");
+
+    room = document.getElementById("room").value;
+    if (!room) return alert("Enter a room name");
+
+    pc = new RTCPeerConnection();
+
+    pc.ontrack = (event) => {
+      document.getElementById("video").srcObject = event.streams[0];
+    };
+
+    pc.onicecandidate = async (event) => {
+      if (event.candidate) {
+        await supabaseClient.from("signals").insert({
+          room,
+          type: "candidate",
+          data: event.candidate
+        });
+      }
+    };
+
+    const { data, error } = await supabaseClient
+      .from("signals")
+      .select("*")
+      .eq("room", room)
+      .eq("type", "offer")
+      .single();
+
+    if (error) throw error;
+
+    await pc.setRemoteDescription(new RTCSessionDescription(data.data));
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    await supabaseClient.from("signals").insert({
+      room,
+      type: "answer",
+      data: answer
+    });
+
+    listenForCandidates();
+
+    setStatus("Connected!");
+  } catch (err) {
+    console.error(err);
+    alert("ERROR: " + err.message);
+    setStatus("Error: " + err.message);
+  }
+}
+
+function listenForAnswer() {
+  supabaseClient
+    .channel("room-" + room)
+    .on("postgres_changes", {
+      event: "INSERT",
+      schema: "public",
+      table: "signals",
+      filter: "room=eq." + room
+    }, async (payload) => {
+      if (payload.new.type === "answer") {
+        await pc.setRemoteDescription(new RTCSessionDescription(payload.new.data));
+      }
+      if (payload.new.type === "candidate") {
+        await pc.addIceCandidate(new RTCIceCandidate(payload.new.data));
+      }
+    })
+    .subscribe();
+}
+
+function listenForCandidates() {
+  supabaseClient
+    .channel("room-" + room)
+    .on("postgres_changes", {
+      event: "INSERT",
+      schema: "public",
+      table: "signals",
+      filter: "room=eq." + room
+    }, async (payload) => {
+      if (payload.new.type === "candidate") {
+        await pc.addIceCandidate(new RTCIceCandidate(payload.new.data));
+      }
+    })
+    .subscribe();
+}
+</script>
+</body>
+</html>
