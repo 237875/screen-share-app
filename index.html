@@ -19,24 +19,25 @@
 <script>
 const SUPABASE_URL = "https://tvdrhuwhrazvoegsxykb.supabase.co";
 const SUPABASE_KEY = "sb_publishable_TYeHsv6kmk2KETnhYNapAg_Zc6j8LDi";
+
 const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-let pc, room, sessionId, localStream;
-let heartbeat, staleCheck;
+let pc;
+let room;
+let sessionId;
+let localStream;
 
-const HEARTBEAT_MS = 2000;
-const STALE_MS = 8000;
+const seenCandidates = new Set();
 
 function setStatus(msg){
   document.getElementById("status").innerText = msg;
 }
 
-// ✅ STUN + TURN (CRITICAL FIX)
-function createPeerConnection(){
+// 🔥 STUN + TURN (critical for cross-network video)
+function createPC(){
   const pc = new RTCPeerConnection({
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" },
-      { urls: "stun:stun1.l.google.com:19302" },
       {
         urls: "turn:openrelay.metered.ca:80",
         username: "openrelayproject",
@@ -45,17 +46,20 @@ function createPeerConnection(){
     ]
   });
 
-  pc.ontrack = e => {
-    document.getElementById("video").srcObject = e.streams[0];
+  pc.ontrack = (event) => {
+    console.log("TRACK RECEIVED");
+    const video = document.getElementById("video");
+    video.srcObject = event.streams[0];
+    video.play().catch(()=>{});
   };
 
-  pc.onicecandidate = async e => {
-    if (e.candidate && sessionId) {
+  pc.onicecandidate = async (event) => {
+    if (event.candidate && sessionId) {
       await supabaseClient.from("signals").insert({
         room,
         session: sessionId,
         type: "candidate",
-        data: e.candidate,
+        data: event.candidate,
         updated_at: new Date().toISOString()
       });
     }
@@ -71,14 +75,18 @@ async function startSharing(){
     if(!room) return alert("Enter room");
 
     sessionId = Date.now().toString();
-    pc = createPeerConnection();
+    pc = createPC();
 
     setStatus("Requesting screen...");
 
     localStream = await navigator.mediaDevices.getDisplayMedia({ video:true });
     document.getElementById("video").srcObject = localStream;
 
-    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    localStream.getTracks().forEach(track => {
+      pc.addTrack(track, localStream);
+    });
+
+    await new Promise(r => setTimeout(r, 300));
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -93,18 +101,10 @@ async function startSharing(){
 
     setStatus("Waiting for viewer...");
 
-    // 💓 heartbeat
-    heartbeat = setInterval(async ()=>{
-      await supabaseClient.from("signals")
-        .update({ updated_at: new Date().toISOString() })
-        .eq("room", room)
-        .eq("session", sessionId)
-        .eq("type","offer");
-    }, HEARTBEAT_MS);
-
-    // wait answer
+    // answer loop
     setInterval(async ()=>{
-      const {data} = await supabaseClient.from("signals")
+      const { data } = await supabaseClient
+        .from("signals")
         .select("*")
         .eq("room", room)
         .eq("session", sessionId)
@@ -117,18 +117,25 @@ async function startSharing(){
       }
     },1000);
 
-    // candidates
+    // candidates (deduped)
     setInterval(async ()=>{
-      const {data} = await supabaseClient.from("signals")
+      const { data } = await supabaseClient
+        .from("signals")
         .select("*")
         .eq("room", room)
         .eq("session", sessionId)
         .eq("type","candidate");
 
-      (data||[]).forEach(async c=>{
-        try{ await pc.addIceCandidate(new RTCIceCandidate(c.data)); }catch{}
-      });
-    },1500);
+      for(const c of (data||[])){
+        const key = JSON.stringify(c.data);
+        if(seenCandidates.has(key)) continue;
+        seenCandidates.add(key);
+
+        try{
+          await pc.addIceCandidate(new RTCIceCandidate(c.data));
+        }catch(e){}
+      }
+    },1000);
 
   }catch(e){
     alert(e.message);
@@ -141,11 +148,12 @@ async function join(){
     room = document.getElementById("room").value;
     if(!room) return alert("Enter room");
 
-    pc = createPeerConnection();
+    pc = createPC();
     setStatus("Searching for host...");
 
     const find = setInterval(async ()=>{
-      const {data} = await supabaseClient.from("signals")
+      const { data } = await supabaseClient
+        .from("signals")
         .select("*")
         .eq("room", room)
         .eq("type","offer")
@@ -172,8 +180,7 @@ async function join(){
 
         setStatus("Connected! Receiving video...");
 
-        watchCandidates();
-        watchDisconnect();
+        startCandidates();
       }
     },1000);
 
@@ -182,62 +189,29 @@ async function join(){
   }
 }
 
-function watchCandidates(){
+// 🔵 VIEWER candidates
+function startCandidates(){
   setInterval(async ()=>{
     if(!sessionId) return;
 
-    const {data} = await supabaseClient.from("signals")
+    const { data } = await supabaseClient
+      .from("signals")
       .select("*")
       .eq("room", room)
       .eq("session", sessionId)
       .eq("type","candidate");
 
-    (data||[]).forEach(async c=>{
-      try{ await pc.addIceCandidate(new RTCIceCandidate(c.data)); }catch{}
-    });
-  },1500);
-}
+    for(const c of (data||[])){
+      const key = JSON.stringify(c.data);
+      if(seenCandidates.has(key)) continue;
+      seenCandidates.add(key);
 
-// 🧠 detect host disconnect
-function watchDisconnect(){
-  staleCheck = setInterval(async ()=>{
-    const {data} = await supabaseClient.from("signals")
-      .select("updated_at")
-      .eq("room", room)
-      .eq("session", sessionId)
-      .eq("type","offer")
-      .limit(1);
-
-    if(!data || !data.length){
-      disconnect("Host gone");
-      return;
+      try{
+        await pc.addIceCandidate(new RTCIceCandidate(c.data));
+      }catch(e){}
     }
-
-    const last = new Date(data[0].updated_at).getTime();
-    if(Date.now() - last > STALE_MS){
-      disconnect("Host disconnected");
-    }
-  },2000);
+  },1000);
 }
-
-function disconnect(msg){
-  clearInterval(staleCheck);
-  try{ pc.close(); }catch{}
-  document.getElementById("video").srcObject = null;
-  setStatus(msg);
-}
-
-// cleanup
-window.addEventListener("beforeunload", async ()=>{
-  try{
-    if(room && sessionId){
-      await supabaseClient.from("signals")
-        .delete()
-        .eq("room", room)
-        .eq("session", sessionId);
-    }
-  }catch{}
-});
 </script>
 </body>
 </html>
