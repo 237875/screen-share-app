@@ -52,16 +52,14 @@ function createPeerConnection() {
 
 async function startSharing() {
   try {
-    setStatus("Starting screen share...");
-
     room = document.getElementById("room").value;
     if (!room) return alert("Enter a room name");
 
+    setStatus("Starting screen share...");
+
     pc = createPeerConnection();
 
-    // 👇 This triggers screen share prompt
     localStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-
     document.getElementById("video").srcObject = localStream;
 
     localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
@@ -75,11 +73,45 @@ async function startSharing() {
       data: offer
     });
 
-    listenForAnswer();
+    setStatus("Waiting for viewer...");
 
-    setStatus("Sharing started. Waiting for viewer...");
+    // 🔁 WAIT FOR ANSWER
+    const waitAnswer = setInterval(async () => {
+      const { data } = await supabaseClient
+        .from("signals")
+        .select("*")
+        .eq("room", room)
+        .eq("type", "answer")
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (data && data.length > 0) {
+        clearInterval(waitAnswer);
+
+        await pc.setRemoteDescription(
+          new RTCSessionDescription(data[0].data)
+        );
+
+        setStatus("Viewer connected!");
+      }
+    }, 1000);
+
+    // 🔁 RECEIVE CANDIDATES
+    setInterval(async () => {
+      const { data } = await supabaseClient
+        .from("signals")
+        .select("*")
+        .eq("room", room)
+        .eq("type", "candidate");
+
+      data.forEach(async (c) => {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(c.data));
+        } catch {}
+      });
+    }, 2000);
+
   } catch (err) {
-    console.error(err);
     alert("ERROR: " + err.message);
     setStatus("Error: " + err.message);
   }
@@ -87,150 +119,62 @@ async function startSharing() {
 
 async function join() {
   try {
-    setStatus("Joining... waiting for host...");
-
     room = document.getElementById("room").value;
     if (!room) return alert("Enter a room name");
 
+    setStatus("Searching for host...");
+
     pc = createPeerConnection();
 
-    // 👇 Listen for EVERYTHING (offer + candidates)
-    supabaseClient
-      .channel("room-" + room)
-      .on("postgres_changes", {
-        event: "INSERT",
-        schema: "public",
-        table: "signals",
-        filter: "room=eq." + room
-      }, async (payload) => {
+    // 🔁 WAIT FOR OFFER
+    const waitOffer = setInterval(async () => {
+      const { data } = await supabaseClient
+        .from("signals")
+        .select("*")
+        .eq("room", room)
+        .eq("type", "offer")
+        .order("created_at", { ascending: false })
+        .limit(1);
 
-        if (payload.new.type === "offer") {
-          setStatus("Offer received! Connecting...");
+      if (data && data.length > 0) {
+        clearInterval(waitOffer);
 
-          await pc.setRemoteDescription(new RTCSessionDescription(payload.new.data));
+        setStatus("Host found! Connecting...");
 
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
+        await pc.setRemoteDescription(
+          new RTCSessionDescription(data[0].data)
+        );
 
-          await supabaseClient.from("signals").insert({
-            room,
-            type: "answer",
-            data: answer
-          });
-        }
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
 
-        if (payload.new.type === "candidate") {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(payload.new.data));
-          } catch (e) {
-            console.warn("Candidate error:", e);
-          }
-        }
-      })
-      .subscribe();
-
-  } catch (err) {
-    console.error(err);
-    alert("ERROR: " + err.message);
-    setStatus("Error: " + err.message);
-  }
-}
-
-function listenForAnswer() {
-  supabaseClient
-    .channel("room-answer-" + room)
-    .on("postgres_changes", {
-      event: "INSERT",
-      schema: "public",
-      table: "signals",
-      filter: "room=eq." + room
-    }, async (payload) => {
-
-      if (payload.new.type === "answer") {
-        setStatus("Viewer connected!");
-
-        await pc.setRemoteDescription(new RTCSessionDescription(payload.new.data));
+        await supabaseClient.from("signals").insert({
+          room,
+          type: "answer",
+          data: answer
+        });
       }
+    }, 1000);
 
-      if (payload.new.type === "candidate") {
+    // 🔁 RECEIVE CANDIDATES
+    setInterval(async () => {
+      const { data } = await supabaseClient
+        .from("signals")
+        .select("*")
+        .eq("room", room)
+        .eq("type", "candidate");
+
+      data.forEach(async (c) => {
         try {
-          await pc.addIceCandidate(new RTCIceCandidate(payload.new.data));
-        } catch (e) {
-          console.warn("Candidate error:", e);
-        }
-      }
-    })
-    .subscribe();
-}
-</script>
-</body>
-</html>      .eq("type", "offer")
-      .order("created_at", { ascending: false })
-      .limit(1);
+          await pc.addIceCandidate(new RTCIceCandidate(c.data));
+        } catch {}
+      });
+    }, 2000);
 
-    if (error) throw error;
-
-    if (!data || data.length === 0) {
-      alert("No offer found. Make sure someone clicked Start Sharing first.");
-      return;
-    }
-
-    const offerData = data[0];
-
-    await pc.setRemoteDescription(new RTCSessionDescription(offerData.data));
-
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-
-    await supabaseClient.from("signals").insert({
-      room,
-      type: "answer",
-      data: answer
-    });
-
-    listenForCandidates();
-
-    setStatus("Connected!");
   } catch (err) {
-    console.error(err);
     alert("ERROR: " + err.message);
     setStatus("Error: " + err.message);
   }
-}
-
-function listenForAnswer() {
-  supabaseClient
-    .channel("room-" + room)
-    .on("postgres_changes", {
-      event: "INSERT",
-      schema: "public",
-      table: "signals",
-      filter: "room=eq." + room
-    }, async (payload) => {
-      if (payload.new.type === "answer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(payload.new.data));
-      }
-      if (payload.new.type === "candidate") {
-        await pc.addIceCandidate(new RTCIceCandidate(payload.new.data));
-      }
-    })
-    .subscribe();
-}
-
-function listenForCandidates() {
-  supabaseClient
-    .channel("room-" + room)
-    .on("postgres_changes", {
-      event: "INSERT",
-      schema: "public",
-      table: "signals",
-      filter: "room=eq." + room
-    }, async (payload) => {
-      if (payload.new.type === "candidate") {
-        await pc.addIceCandidate(new RTCIceCandidate(payload.new.data));
-      }
-    })
-    .subscribe();
 }
 </script>
 </body>
