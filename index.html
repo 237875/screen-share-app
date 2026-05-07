@@ -26,10 +26,20 @@ let pc;
 let room;
 let localStream;
 
+// 🔹 Status helper
 function setStatus(msg) {
   document.getElementById("status").innerText = msg;
 }
 
+// 🔹 Clear room data
+async function clearRoom(roomName) {
+  await supabaseClient
+    .from("signals")
+    .delete()
+    .eq("room", roomName);
+}
+
+// 🔹 Create connection
 function createPeerConnection() {
   const pc = new RTCPeerConnection();
 
@@ -50,14 +60,20 @@ function createPeerConnection() {
   return pc;
 }
 
+// 🔴 HOST
 async function startSharing() {
   try {
     room = document.getElementById("room").value;
     if (!room) return alert("Enter a room name");
 
-    setStatus("Starting screen share...");
+    setStatus("Preparing room...");
+
+    // ✅ CLEAR OLD DATA
+    await clearRoom(room);
 
     pc = createPeerConnection();
+
+    setStatus("Requesting screen share...");
 
     localStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
     document.getElementById("video").srcObject = localStream;
@@ -112,11 +128,13 @@ async function startSharing() {
     }, 2000);
 
   } catch (err) {
+    console.error(err);
     alert("ERROR: " + err.message);
     setStatus("Error: " + err.message);
   }
 }
 
+// 🔵 VIEWER
 async function join() {
   try {
     room = document.getElementById("room").value;
@@ -172,6 +190,7 @@ async function join() {
     }, 2000);
 
   } catch (err) {
+    console.error(err);
     alert("ERROR: " + err.message);
     setStatus("Error: " + err.message);
   }
