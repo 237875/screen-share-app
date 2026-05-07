@@ -39,7 +39,7 @@ function createPeerConnection() {
   };
 
   pc.onicecandidate = async (event) => {
-    if (event.candidate) {
+    if (event.candidate && sessionId) {
       await supabaseClient.from("signals").insert({
         room,
         session: sessionId,
@@ -58,9 +58,9 @@ async function startSharing() {
     room = document.getElementById("room").value;
     if (!room) return alert("Enter a room name");
 
-    sessionId = Date.now().toString(); // 🔥 unique session
+    sessionId = Date.now().toString();
 
-    setStatus("Starting new session...");
+    setStatus("Starting session...");
 
     pc = createPeerConnection();
 
@@ -81,7 +81,7 @@ async function startSharing() {
 
     setStatus("Waiting for viewer...");
 
-    // WAIT FOR ANSWER (same session only)
+    // 🔁 WAIT FOR ANSWER
     setInterval(async () => {
       const { data } = await supabaseClient
         .from("signals")
@@ -91,13 +91,29 @@ async function startSharing() {
         .eq("type", "answer")
         .limit(1);
 
-      if (data && data.length > 0) {
+      if (data && data.length > 0 && !pc.currentRemoteDescription) {
         await pc.setRemoteDescription(
           new RTCSessionDescription(data[0].data)
         );
         setStatus("Viewer connected!");
       }
     }, 1000);
+
+    // 🔁 RECEIVE CANDIDATES
+    setInterval(async () => {
+      const { data } = await supabaseClient
+        .from("signals")
+        .select("*")
+        .eq("room", room)
+        .eq("session", sessionId)
+        .eq("type", "candidate");
+
+      for (const c of data) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(c.data));
+        } catch {}
+      }
+    }, 2000);
 
   } catch (err) {
     alert(err.message);
@@ -111,11 +127,11 @@ async function join() {
     room = document.getElementById("room").value;
     if (!room) return alert("Enter a room name");
 
-    setStatus("Looking for active host...");
+    setStatus("Searching for host...");
 
     pc = createPeerConnection();
 
-    // FIND LATEST SESSION
+    // 🔁 FIND SESSION
     const findSession = setInterval(async () => {
       const { data } = await supabaseClient
         .from("signals")
@@ -145,8 +161,28 @@ async function join() {
           type: "answer",
           data: answer
         });
+
+        setStatus("Connected! Receiving video...");
       }
     }, 1000);
+
+    // 🔁 RECEIVE CANDIDATES
+    setInterval(async () => {
+      if (!sessionId) return;
+
+      const { data } = await supabaseClient
+        .from("signals")
+        .select("*")
+        .eq("room", room)
+        .eq("session", sessionId)
+        .eq("type", "candidate");
+
+      for (const c of data) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(c.data));
+        } catch {}
+      }
+    }, 2000);
 
   } catch (err) {
     alert(err.message);
