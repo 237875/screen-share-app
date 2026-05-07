@@ -1,40 +1,39 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Screen Share App</title>
+  <title>Screen Share Fixed</title>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
   <h2>Screen Share</h2>
 
   <input id="room" placeholder="Room name">
-  <button onclick="startSharing()">Start Sharing</button>
+  <button onclick="start()">Start Sharing</button>
   <button onclick="join()">Join</button>
 
   <p id="status">Idle</p>
 
-  <br><br>
   <video id="video" autoplay playsinline controls style="width:600px;"></video>
 
 <script>
-const SUPABASE_URL = "https://tvdrhuwhrazvoegsxykb.supabase.co";
-const SUPABASE_KEY = "sb_publishable_TYeHsv6kmk2KETnhYNapAg_Zc6j8LDi";
-
-const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabaseClient = supabase.createClient(
+  "https://tvdrhuwhrazvoegsxykb.supabase.co",
+  "sb_publishable_TYeHsv6kmk2KETnhYNapAg_Zc6j8LDi"
+);
 
 let pc;
 let room;
 let sessionId;
-let localStream;
+let stream;
 
-const seenCandidates = new Set();
+const seen = new Set();
 
-function setStatus(msg){
-  document.getElementById("status").innerText = msg;
+function status(t){
+  document.getElementById("status").innerText = t;
 }
 
-// 🔥 STUN + TURN (critical for cross-network video)
-function createPC(){
+// 🔥 CLEAN WebRTC config
+function makePC(){
   const pc = new RTCPeerConnection({
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" },
@@ -46,155 +45,75 @@ function createPC(){
     ]
   });
 
-  pc.ontrack = (event) => {
-    console.log("TRACK RECEIVED");
-    const video = document.getElementById("video");
-    video.srcObject = event.streams[0];
-    video.play().catch(()=>{});
+  pc.ontrack = (e)=>{
+    document.getElementById("video").srcObject = e.streams[0];
   };
 
-  pc.onicecandidate = async (event) => {
-    if (event.candidate && sessionId) {
-      await supabaseClient.from("signals").insert({
-        room,
-        session: sessionId,
-        type: "candidate",
-        data: event.candidate,
-        updated_at: new Date().toISOString()
-      });
-    }
+  // 🚨 SEND ICE ONLY ONCE (NO DB FLOODING ISSUES)
+  pc.onicecandidate = async (e)=>{
+    if(!e.candidate) return;
+
+    await supabaseClient.from("signals").insert({
+      room,
+      session: sessionId,
+      type: "candidate",
+      data: e.candidate,
+      updated_at: new Date().toISOString()
+    });
   };
 
   return pc;
 }
 
 // 🔴 HOST
-async function startSharing(){
-  try{
-    room = document.getElementById("room").value;
-    if(!room) return alert("Enter room");
+async function start(){
+  room = document.getElementById("room").value;
+  if(!room) return alert("Enter room");
 
-    sessionId = Date.now().toString();
-    pc = createPC();
+  sessionId = Date.now().toString();
+  pc = makePC();
 
-    setStatus("Requesting screen...");
+  status("Starting screen share...");
 
-    localStream = await navigator.mediaDevices.getDisplayMedia({ video:true });
-    document.getElementById("video").srcObject = localStream;
+  stream = await navigator.mediaDevices.getDisplayMedia({video:true});
+  document.getElementById("video").srcObject = stream;
 
-    localStream.getTracks().forEach(track => {
-      pc.addTrack(track, localStream);
-    });
+  stream.getTracks().forEach(t=>pc.addTrack(t, stream));
 
-    await new Promise(r => setTimeout(r, 300));
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+  await supabaseClient.from("signals").insert({
+    room,
+    session: sessionId,
+    type: "offer",
+    data: offer
+  });
 
-    await supabaseClient.from("signals").insert({
-      room,
-      session: sessionId,
-      type: "offer",
-      data: offer,
-      updated_at: new Date().toISOString()
-    });
+  status("Waiting for viewer...");
 
-    setStatus("Waiting for viewer...");
-
-    // answer loop
-    setInterval(async ()=>{
-      const { data } = await supabaseClient
-        .from("signals")
-        .select("*")
-        .eq("room", room)
-        .eq("session", sessionId)
-        .eq("type","answer")
-        .limit(1);
-
-      if(data && data.length && !pc.currentRemoteDescription){
-        await pc.setRemoteDescription(new RTCSessionDescription(data[0].data));
-        setStatus("Viewer connected!");
-      }
-    },1000);
-
-    // candidates (deduped)
-    setInterval(async ()=>{
-      const { data } = await supabaseClient
-        .from("signals")
-        .select("*")
-        .eq("room", room)
-        .eq("session", sessionId)
-        .eq("type","candidate");
-
-      for(const c of (data||[])){
-        const key = JSON.stringify(c.data);
-        if(seenCandidates.has(key)) continue;
-        seenCandidates.add(key);
-
-        try{
-          await pc.addIceCandidate(new RTCIceCandidate(c.data));
-        }catch(e){}
-      }
-    },1000);
-
-  }catch(e){
-    alert(e.message);
-  }
-}
-
-// 🔵 VIEWER
-async function join(){
-  try{
-    room = document.getElementById("room").value;
-    if(!room) return alert("Enter room");
-
-    pc = createPC();
-    setStatus("Searching for host...");
-
-    const find = setInterval(async ()=>{
-      const { data } = await supabaseClient
-        .from("signals")
-        .select("*")
-        .eq("room", room)
-        .eq("type","offer")
-        .order("created_at",{ascending:false})
-        .limit(1);
-
-      if(data && data.length){
-        clearInterval(find);
-
-        sessionId = data[0].session;
-
-        await pc.setRemoteDescription(new RTCSessionDescription(data[0].data));
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-
-        await supabaseClient.from("signals").insert({
-          room,
-          session: sessionId,
-          type:"answer",
-          data: answer,
-          updated_at: new Date().toISOString()
-        });
-
-        setStatus("Connected! Receiving video...");
-
-        startCandidates();
-      }
-    },1000);
-
-  }catch(e){
-    alert(e.message);
-  }
-}
-
-// 🔵 VIEWER candidates
-function startCandidates(){
+  // answer listener (NO ICE HERE ANYMORE)
   setInterval(async ()=>{
-    if(!sessionId) return;
+    const {data} = await supabaseClient
+      .from("signals")
+      .select("*")
+      .eq("room", room)
+      .eq("session", sessionId)
+      .eq("type","answer")
+      .limit(1);
 
-    const { data } = await supabaseClient
+    if(data?.length && !pc.currentRemoteDescription){
+      await pc.setRemoteDescription(
+        new RTCSessionDescription(data[0].data)
+      );
+
+      status("Viewer connected!");
+    }
+  },1000);
+
+  // 🔥 ONLY APPLY NEW CANDIDATES (NO REPEATS)
+  setInterval(async ()=>{
+    const {data} = await supabaseClient
       .from("signals")
       .select("*")
       .eq("room", room)
@@ -202,13 +121,79 @@ function startCandidates(){
       .eq("type","candidate");
 
     for(const c of (data||[])){
-      const key = JSON.stringify(c.data);
-      if(seenCandidates.has(key)) continue;
-      seenCandidates.add(key);
+      const id = JSON.stringify(c.data);
+      if(seen.has(id)) continue;
+      seen.add(id);
 
       try{
         await pc.addIceCandidate(new RTCIceCandidate(c.data));
-      }catch(e){}
+      }catch{}
+    }
+  },1000);
+}
+
+// 🔵 VIEWER
+async function join(){
+  room = document.getElementById("room").value;
+  if(!room) return alert("Enter room");
+
+  pc = makePC();
+
+  status("Searching...");
+
+  const find = setInterval(async ()=>{
+    const {data} = await supabaseClient
+      .from("signals")
+      .select("*")
+      .eq("room", room)
+      .eq("type","offer")
+      .order("created_at",{ascending:false})
+      .limit(1);
+
+    if(data?.length){
+      clearInterval(find);
+
+      sessionId = data[0].session;
+
+      await pc.setRemoteDescription(
+        new RTCSessionDescription(data[0].data)
+      );
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      await supabaseClient.from("signals").insert({
+        room,
+        session: sessionId,
+        type:"answer",
+        data: answer
+      });
+
+      status("Connected!");
+
+      listenCandidates();
+    }
+  },1000);
+}
+
+// 🔵 VIEWER candidate listener (NO POLLING LOOP SPAM)
+function listenCandidates(){
+  setInterval(async ()=>{
+    const {data} = await supabaseClient
+      .from("signals")
+      .select("*")
+      .eq("room", room)
+      .eq("session", sessionId)
+      .eq("type","candidate");
+
+    for(const c of (data||[])){
+      const id = JSON.stringify(c.data);
+      if(seen.has(id)) continue;
+      seen.add(id);
+
+      try{
+        await pc.addIceCandidate(new RTCIceCandidate(c.data));
+      }catch{}
     }
   },1000);
 }
