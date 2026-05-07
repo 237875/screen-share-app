@@ -24,22 +24,13 @@ const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
 let pc;
 let room;
+let sessionId;
 let localStream;
 
-// 🔹 Status helper
 function setStatus(msg) {
   document.getElementById("status").innerText = msg;
 }
 
-// 🔹 Clear room data
-async function clearRoom(roomName) {
-  await supabaseClient
-    .from("signals")
-    .delete()
-    .eq("room", roomName);
-}
-
-// 🔹 Create connection
 function createPeerConnection() {
   const pc = new RTCPeerConnection();
 
@@ -51,6 +42,7 @@ function createPeerConnection() {
     if (event.candidate) {
       await supabaseClient.from("signals").insert({
         room,
+        session: sessionId,
         type: "candidate",
         data: event.candidate
       });
@@ -66,14 +58,11 @@ async function startSharing() {
     room = document.getElementById("room").value;
     if (!room) return alert("Enter a room name");
 
-    setStatus("Preparing room...");
+    sessionId = Date.now().toString(); // 🔥 unique session
 
-    // ✅ CLEAR OLD DATA
-    await clearRoom(room);
+    setStatus("Starting new session...");
 
     pc = createPeerConnection();
-
-    setStatus("Requesting screen share...");
 
     localStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
     document.getElementById("video").srcObject = localStream;
@@ -85,51 +74,33 @@ async function startSharing() {
 
     await supabaseClient.from("signals").insert({
       room,
+      session: sessionId,
       type: "offer",
       data: offer
     });
 
     setStatus("Waiting for viewer...");
 
-    // 🔁 WAIT FOR ANSWER
-    const waitAnswer = setInterval(async () => {
-      const { data } = await supabaseClient
-        .from("signals")
-        .select("*")
-        .eq("room", room)
-        .eq("type", "answer")
-        .order("created_at", { ascending: false })
-        .limit(1);
-
-      if (data && data.length > 0) {
-        clearInterval(waitAnswer);
-
-        await pc.setRemoteDescription(
-          new RTCSessionDescription(data[0].data)
-        );
-
-        setStatus("Viewer connected!");
-      }
-    }, 1000);
-
-    // 🔁 RECEIVE CANDIDATES
+    // WAIT FOR ANSWER (same session only)
     setInterval(async () => {
       const { data } = await supabaseClient
         .from("signals")
         .select("*")
         .eq("room", room)
-        .eq("type", "candidate");
+        .eq("session", sessionId)
+        .eq("type", "answer")
+        .limit(1);
 
-      data.forEach(async (c) => {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(c.data));
-        } catch {}
-      });
-    }, 2000);
+      if (data && data.length > 0) {
+        await pc.setRemoteDescription(
+          new RTCSessionDescription(data[0].data)
+        );
+        setStatus("Viewer connected!");
+      }
+    }, 1000);
 
   } catch (err) {
-    console.error(err);
-    alert("ERROR: " + err.message);
+    alert(err.message);
     setStatus("Error: " + err.message);
   }
 }
@@ -140,12 +111,12 @@ async function join() {
     room = document.getElementById("room").value;
     if (!room) return alert("Enter a room name");
 
-    setStatus("Searching for host...");
+    setStatus("Looking for active host...");
 
     pc = createPeerConnection();
 
-    // 🔁 WAIT FOR OFFER
-    const waitOffer = setInterval(async () => {
+    // FIND LATEST SESSION
+    const findSession = setInterval(async () => {
       const { data } = await supabaseClient
         .from("signals")
         .select("*")
@@ -155,7 +126,9 @@ async function join() {
         .limit(1);
 
       if (data && data.length > 0) {
-        clearInterval(waitOffer);
+        clearInterval(findSession);
+
+        sessionId = data[0].session;
 
         setStatus("Host found! Connecting...");
 
@@ -168,30 +141,15 @@ async function join() {
 
         await supabaseClient.from("signals").insert({
           room,
+          session: sessionId,
           type: "answer",
           data: answer
         });
       }
     }, 1000);
 
-    // 🔁 RECEIVE CANDIDATES
-    setInterval(async () => {
-      const { data } = await supabaseClient
-        .from("signals")
-        .select("*")
-        .eq("room", room)
-        .eq("type", "candidate");
-
-      data.forEach(async (c) => {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(c.data));
-        } catch {}
-      });
-    }, 2000);
-
   } catch (err) {
-    console.error(err);
-    alert("ERROR: " + err.message);
+    alert(err.message);
     setStatus("Error: " + err.message);
   }
 }
