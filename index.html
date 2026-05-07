@@ -21,38 +21,41 @@ const SUPABASE_URL = "https://tvdrhuwhrazvoegsxykb.supabase.co";
 const SUPABASE_KEY = "sb_publishable_TYeHsv6kmk2KETnhYNapAg_Zc6j8LDi";
 const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-let pc;
-let room;
-let sessionId;
-let localStream;
+let pc, room, sessionId, localStream;
+let heartbeat, staleCheck;
 
-let heartbeatTimer;
-let answerPollTimer;
-let offerPollTimer;
-let candidatePollTimer;
-let staleCheckTimer;
+const HEARTBEAT_MS = 2000;
+const STALE_MS = 8000;
 
-const HEARTBEAT_MS = 2000;      // host updates every 2s
-const STALE_MS = 7000;          // if no update for 7s → dead
-
-function setStatus(msg) {
+function setStatus(msg){
   document.getElementById("status").innerText = msg;
 }
 
-function createPeerConnection() {
-  const pc = new RTCPeerConnection();
+// ✅ STUN + TURN (CRITICAL FIX)
+function createPeerConnection(){
+  const pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      {
+        urls: "turn:openrelay.metered.ca:80",
+        username: "openrelayproject",
+        credential: "openrelayproject"
+      }
+    ]
+  });
 
-  pc.ontrack = (event) => {
-    document.getElementById("video").srcObject = event.streams[0];
+  pc.ontrack = e => {
+    document.getElementById("video").srcObject = e.streams[0];
   };
 
-  pc.onicecandidate = async (event) => {
-    if (event.candidate && sessionId) {
+  pc.onicecandidate = async e => {
+    if (e.candidate && sessionId) {
       await supabaseClient.from("signals").insert({
         room,
         session: sessionId,
         type: "candidate",
-        data: event.candidate,
+        data: e.candidate,
         updated_at: new Date().toISOString()
       });
     }
@@ -62,25 +65,24 @@ function createPeerConnection() {
 }
 
 // 🔴 HOST
-async function startSharing() {
-  try {
+async function startSharing(){
+  try{
     room = document.getElementById("room").value;
-    if (!room) return alert("Enter a room name");
+    if(!room) return alert("Enter room");
 
     sessionId = Date.now().toString();
-
-    setStatus("Starting session...");
-
     pc = createPeerConnection();
 
-    localStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+    setStatus("Requesting screen...");
+
+    localStream = await navigator.mediaDevices.getDisplayMedia({ video:true });
     document.getElementById("video").srcObject = localStream;
+
     localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    // insert offer (acts as “host presence” row)
     await supabaseClient.from("signals").insert({
       room,
       session: sessionId,
@@ -91,78 +93,69 @@ async function startSharing() {
 
     setStatus("Waiting for viewer...");
 
-    // 💓 HEARTBEAT: keep offer.updated_at fresh
-    heartbeatTimer = setInterval(async () => {
-      await supabaseClient
-        .from("signals")
+    // 💓 heartbeat
+    heartbeat = setInterval(async ()=>{
+      await supabaseClient.from("signals")
         .update({ updated_at: new Date().toISOString() })
         .eq("room", room)
         .eq("session", sessionId)
-        .eq("type", "offer");
+        .eq("type","offer");
     }, HEARTBEAT_MS);
 
-    // 🔁 WAIT FOR ANSWER
-    answerPollTimer = setInterval(async () => {
-      const { data } = await supabaseClient
-        .from("signals")
+    // wait answer
+    setInterval(async ()=>{
+      const {data} = await supabaseClient.from("signals")
         .select("*")
         .eq("room", room)
         .eq("session", sessionId)
-        .eq("type", "answer")
+        .eq("type","answer")
         .limit(1);
 
-      if (data && data.length > 0 && !pc.currentRemoteDescription) {
+      if(data && data.length && !pc.currentRemoteDescription){
         await pc.setRemoteDescription(new RTCSessionDescription(data[0].data));
         setStatus("Viewer connected!");
       }
-    }, 1000);
+    },1000);
 
-    // 🔁 RECEIVE CANDIDATES
-    candidatePollTimer = setInterval(async () => {
-      const { data } = await supabaseClient
-        .from("signals")
+    // candidates
+    setInterval(async ()=>{
+      const {data} = await supabaseClient.from("signals")
         .select("*")
         .eq("room", room)
         .eq("session", sessionId)
-        .eq("type", "candidate");
+        .eq("type","candidate");
 
-      for (const c of (data || [])) {
-        try { await pc.addIceCandidate(new RTCIceCandidate(c.data)); } catch {}
-      }
-    }, 1500);
+      (data||[]).forEach(async c=>{
+        try{ await pc.addIceCandidate(new RTCIceCandidate(c.data)); }catch{}
+      });
+    },1500);
 
-  } catch (err) {
-    alert(err.message);
-    setStatus("Error: " + err.message);
+  }catch(e){
+    alert(e.message);
   }
 }
 
 // 🔵 VIEWER
-async function join() {
-  try {
+async function join(){
+  try{
     room = document.getElementById("room").value;
-    if (!room) return alert("Enter a room name");
-
-    setStatus("Searching for host...");
+    if(!room) return alert("Enter room");
 
     pc = createPeerConnection();
+    setStatus("Searching for host...");
 
-    // 🔁 FIND LATEST OFFER (session)
-    offerPollTimer = setInterval(async () => {
-      const { data } = await supabaseClient
-        .from("signals")
+    const find = setInterval(async ()=>{
+      const {data} = await supabaseClient.from("signals")
         .select("*")
         .eq("room", room)
-        .eq("type", "offer")
-        .order("created_at", { ascending: false })
+        .eq("type","offer")
+        .order("created_at",{ascending:false})
         .limit(1);
 
-      if (data && data.length > 0) {
-        clearInterval(offerPollTimer);
+      if(data && data.length){
+        clearInterval(find);
 
         sessionId = data[0].session;
-
-        setStatus("Host found! Connecting...");
 
         await pc.setRemoteDescription(new RTCSessionDescription(data[0].data));
 
@@ -172,93 +165,79 @@ async function join() {
         await supabaseClient.from("signals").insert({
           room,
           session: sessionId,
-          type: "answer",
+          type:"answer",
           data: answer,
           updated_at: new Date().toISOString()
         });
 
         setStatus("Connected! Receiving video...");
 
-        startCandidatePolling();
-        startStaleWatcher(); // 👈 detect host disconnect
+        watchCandidates();
+        watchDisconnect();
       }
-    }, 1000);
+    },1000);
 
-  } catch (err) {
-    alert(err.message);
-    setStatus("Error: " + err.message);
+  }catch(e){
+    alert(e.message);
   }
 }
 
-function startCandidatePolling() {
-  candidatePollTimer = setInterval(async () => {
-    if (!sessionId) return;
+function watchCandidates(){
+  setInterval(async ()=>{
+    if(!sessionId) return;
 
-    const { data } = await supabaseClient
-      .from("signals")
+    const {data} = await supabaseClient.from("signals")
       .select("*")
       .eq("room", room)
       .eq("session", sessionId)
-      .eq("type", "candidate");
+      .eq("type","candidate");
 
-    for (const c of (data || [])) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(c.data)); } catch {}
-    }
-  }, 1500);
+    (data||[]).forEach(async c=>{
+      try{ await pc.addIceCandidate(new RTCIceCandidate(c.data)); }catch{}
+    });
+  },1500);
 }
 
-// 🧠 If host stops heartbeating → disconnect
-function startStaleWatcher() {
-  staleCheckTimer = setInterval(async () => {
-    if (!sessionId) return;
-
-    const { data } = await supabaseClient
-      .from("signals")
+// 🧠 detect host disconnect
+function watchDisconnect(){
+  staleCheck = setInterval(async ()=>{
+    const {data} = await supabaseClient.from("signals")
       .select("updated_at")
       .eq("room", room)
       .eq("session", sessionId)
-      .eq("type", "offer")
+      .eq("type","offer")
       .limit(1);
 
-    if (!data || data.length === 0) {
-      handleHostGone("Host row missing");
+    if(!data || !data.length){
+      disconnect("Host gone");
       return;
     }
 
     const last = new Date(data[0].updated_at).getTime();
-    const now = Date.now();
-
-    if (now - last > STALE_MS) {
-      handleHostGone("Host disconnected (timeout)");
+    if(Date.now() - last > STALE_MS){
+      disconnect("Host disconnected");
     }
-  }, 2000);
+  },2000);
 }
 
-function handleHostGone(reason) {
-  clearAllTimers();
-  try { pc && pc.close(); } catch {}
-  setStatus(reason);
+function disconnect(msg){
+  clearInterval(staleCheck);
+  try{ pc.close(); }catch{}
   document.getElementById("video").srcObject = null;
+  setStatus(msg);
 }
 
-// 🧹 best-effort cleanup on leave
-window.addEventListener("beforeunload", async () => {
-  try {
-    if (room && sessionId) {
-      await supabaseClient
-        .from("signals")
+// cleanup
+window.addEventListener("beforeunload", async ()=>{
+  try{
+    if(room && sessionId){
+      await supabaseClient.from("signals")
         .delete()
         .eq("room", room)
         .eq("session", sessionId);
     }
-  } catch {}
-  clearAllTimers();
+  }catch{}
 });
-
-function clearAllTimers() {
-  [heartbeatTimer, answerPollTimer, offerPollTimer, candidatePollTimer, staleCheckTimer]
-    .forEach(t => t && clearInterval(t));
-}
 </script>
 </body>
 </html>
